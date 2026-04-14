@@ -334,13 +334,3 @@ def predict(ticket: Ticket):
 @app.get("/")
 def health():
     return {"status": "running"}
-
-if __name__ == "__main__":
-    import uvicorn
-    import os
-
-    port = int(os.environ.get("PORT", 10000))
-
-    print("Starting server on port:", port)
-
-    uvicorn.run("kanverse_rca_engine:app", host="0.0.0.0", port=port)
