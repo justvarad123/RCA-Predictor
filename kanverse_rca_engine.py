@@ -172,13 +172,16 @@ def cluster_rca():
 def llm_reasoning(new_ticket_text, top_matches):
 
     try:
+        GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+        if not GROQ_API_KEY:
+            return "No GROQ API key found"
 
         context = "\n\n".join([
             f"""
 Ticket ID: {m['ticket_id']}
 RCA: {m['rca']}
 Similarity: {round(m['similarity'],2)}
-Details: {m['doc']}
 """
             for m in top_matches
         ])
@@ -198,7 +201,13 @@ INSTRUCTIONS:
 - Combine RCA + context + conversation
 - Think step-by-step
 
-RETURN STRICT JSON:
+TASK:
+- Predict most accurate root cause
+- Give clear RCA type
+- Provide exact resolution steps
+- Be confident and precise
+
+RETURN JSON:
 {{
   "predicted_rca": "...",
   "rca_type": "...",
@@ -209,19 +218,28 @@ RETURN STRICT JSON:
 """
 
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
             json={
-                "model": "mistral",
-                "prompt": prompt,
-                "stream": False
+                "model": "llama3-70b-8192",  # 🔥 best model
+                "messages": [
+                    {"role": "system", "content": "You are a senior support engineer."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2
             },
             timeout=10
         )
 
-        return response.json().get("response", "")
+        data = response.json()
 
-    except:
-        return "LLM unavailable"
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        return f"LLM Error: {str(e)}"
 
 # -----------------------------
 # PREDICT
