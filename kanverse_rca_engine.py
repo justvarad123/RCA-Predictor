@@ -313,6 +313,9 @@ def predict(ticket: Ticket):
         "llm_reasoning": llm_output
     }
 
+@app.get("/")
+def health():
+    return {"status": "running"}
 
 if __name__ == "__main__":
     import uvicorn
