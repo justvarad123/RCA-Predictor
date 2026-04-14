@@ -19,7 +19,14 @@ META_FILE = "metadata.json"
 # -----------------------------
 # LOAD MODEL
 # -----------------------------
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model
 
 # -----------------------------
 # GLOBAL CACHE
@@ -43,7 +50,7 @@ if os.path.exists(INDEX_FILE):
     ticket_ids = metadata.get("ticket_ids", [])
 
 else:
-    index = faiss.IndexFlatL2(dimension)
+    index = faiss.IndexFlatIP(dimension)  # 🔥 cosine similarity
     documents = []
     rca_list = []
     ticket_ids = []
@@ -79,11 +86,17 @@ def build_text(ticket):
     Conversation: {ticket.conversation}
     """
 
+def normalize(vec):
+    return vec / np.linalg.norm(vec)
+
 def get_embedding(text):
     if text in embedding_cache:
         return embedding_cache[text]
 
+    model = get_model()
     emb = model.encode(text)
+    emb = normalize(emb)
+
     embedding_cache[text] = emb
     return emb
 
@@ -126,9 +139,10 @@ def train_batch(tickets: list[Ticket]):
         return {"message": "No valid tickets"}
 
     # 🚀 BATCH EMBEDDING
-    batch_embeddings = model.encode(new_texts)
+    embeddings = model.encode(new_texts)
 
-    for i, emb in enumerate(batch_embeddings):
+    for i, emb in enumerate(embeddings):
+        emb = normalize(emb)
 
         index.add(np.array([emb]))
 
@@ -153,7 +167,7 @@ def cluster_rca():
     if len(documents) < 5:
         return {}
 
-    embeddings = model.encode(documents)
+    embeddings = get_model().encode(documents)
 
     kmeans = KMeans(n_clusters=min(5, len(documents)), random_state=42)
     labels = kmeans.fit_predict(embeddings)
@@ -161,7 +175,7 @@ def cluster_rca():
     cluster_map = {}
 
     for i, label in enumerate(labels):
-        cluster_map.setdefault(label, []).append(rca_list[i])
+        cluster_map.setdefault(int(label), []).append(rca_list[i])
 
     cluster_cache = cluster_map
     return cluster_map
