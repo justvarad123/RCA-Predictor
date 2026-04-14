@@ -1,225 +1,314 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import DBSCAN
+import faiss
 import numpy as np
 import json
 import os
+from sklearn.cluster import KMeans
+import requests
 
 app = FastAPI()
 
+# -----------------------------
+# CONFIG
+# -----------------------------
+INDEX_FILE = "faiss_index.bin"
+META_FILE = "metadata.json"
+
+# -----------------------------
+# LOAD MODEL
+# -----------------------------
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-MEMORY_FILE = "rca_memory.json"
+# -----------------------------
+# GLOBAL CACHE
+# -----------------------------
+embedding_cache = {}
+cluster_cache = None
 
-# load memory
-if os.path.exists(MEMORY_FILE):
-    with open(MEMORY_FILE) as f:
-        rca_memory = json.load(f)
+# -----------------------------
+# LOAD / INIT STORAGE
+# -----------------------------
+dimension = 384
+
+if os.path.exists(INDEX_FILE):
+    index = faiss.read_index(INDEX_FILE)
+
+    with open(META_FILE, "r") as f:
+        metadata = json.load(f)
+
+    documents = metadata.get("documents", [])
+    rca_list = metadata.get("rca_list", [])
+    ticket_ids = metadata.get("ticket_ids", [])
+
 else:
-    rca_memory = []
+    index = faiss.IndexFlatL2(dimension)
+    documents = []
+    rca_list = []
+    ticket_ids = []
 
+# -----------------------------
+# REQUEST MODEL
+# -----------------------------
 class Ticket(BaseModel):
+    ticket_id: str = ""
+    subject: str = ""
+    description: str = ""
+    product: str = ""
+    module: str = ""
+    environment: str = ""
+    issue_type: str = ""
+    rca_description: str = ""
+    resolution_notes: str = ""
+    conversation: str = ""
 
-    id:int
-    subject:str=""
-    description:str=""
-    description_text:str=""
-    product:str=""
-    module:str=""
-    environment:str=""
-    issue_type:str=""
-    rca_description:str=""
-    resolution_notes:str=""
-    conversations:list[str]=[]
-
-# ------------------------------------------------
-# Utility functions
-# ------------------------------------------------
-
-def build_ticket_context(ticket):
-
-    text = f"""
-    subject: {ticket.subject}
-    description: {ticket.description}
-    description_text: {ticket.description_text}
-    product: {ticket.product}
-    module: {ticket.module}
-    environment: {ticket.environment}
-    issue_type: {ticket.issue_type}
-    rca: {ticket.rca_description}
-    resolution: {ticket.resolution_notes}
-    conversations: {" ".join(ticket.conversations)}
+# -----------------------------
+# HELPERS
+# -----------------------------
+def build_text(ticket):
+    return f"""
+    Subject: {ticket.subject}
+    Description: {ticket.description}
+    Product: {ticket.product}
+    Module: {ticket.module}
+    Environment: {ticket.environment}
+    Issue Type: {ticket.issue_type}
+    RCA: {ticket.rca_description}
+    Resolution: {ticket.resolution_notes}
+    Conversation: {ticket.conversation}
     """
 
-    return text.lower()
+def get_embedding(text):
+    if text in embedding_cache:
+        return embedding_cache[text]
 
-def cosine_similarity(a,b):
-    return np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b))
+    emb = model.encode(text)
+    embedding_cache[text] = emb
+    return emb
 
-# ------------------------------------------------
-# Conversation reasoning
-# ------------------------------------------------
+def save_data():
+    faiss.write_index(index, INDEX_FILE)
 
-def extract_troubleshooting_steps(conversations):
+    with open(META_FILE, "w") as f:
+        json.dump({
+            "documents": documents,
+            "rca_list": rca_list,
+            "ticket_ids": ticket_ids
+        }, f)
 
-    steps=[]
+# -----------------------------
+# TRAIN (BATCH)
+# -----------------------------
+@app.post("/train_batch")
+def train_batch(tickets: list[Ticket]):
 
-    for msg in conversations:
+    global cluster_cache
+    cluster_cache = None  # invalidate cluster cache
 
-        msg=msg.lower()
+    new_texts = []
+    valid_tickets = []
 
-        if "please" in msg or "check" in msg or "try" in msg:
+    for ticket in tickets:
 
-            steps.append(msg)
+        if not ticket.rca_description or not ticket.issue_type:
+            continue
 
-    return steps[:5]
+        if ticket.ticket_id in ticket_ids:
+            continue
 
-# ------------------------------------------------
-# RCA Pattern extraction
-# ------------------------------------------------
+        text = build_text(ticket)
 
-def extract_rca_pattern(rca_text):
+        new_texts.append(text)
+        valid_tickets.append(ticket)
 
-    words = rca_text.lower().split()
+    if not new_texts:
+        return {"message": "No valid tickets"}
 
-    important=[w for w in words if len(w)>4]
+    # 🚀 BATCH EMBEDDING
+    batch_embeddings = model.encode(new_texts)
 
-    pattern=" ".join(important[:5])
+    for i, emb in enumerate(batch_embeddings):
 
-    return pattern
+        index.add(np.array([emb]))
 
-# ------------------------------------------------
-# Save memory
-# ------------------------------------------------
+        documents.append(new_texts[i])
+        rca_list.append(valid_tickets[i].rca_description)
+        ticket_ids.append(valid_tickets[i].ticket_id)
 
-def save_memory():
+    save_data()
 
-    with open(MEMORY_FILE,"w") as f:
-        json.dump(rca_memory,f)
+    return {"stored": len(valid_tickets), "total": len(documents)}
 
-# ------------------------------------------------
-# Learning endpoint
-# ------------------------------------------------
+# -----------------------------
+# CLUSTERING (CACHED)
+# -----------------------------
+def cluster_rca():
 
-@app.post("/learn")
+    global cluster_cache
 
-def learn(ticket:Ticket):
+    if cluster_cache:
+        return cluster_cache
 
-    if not ticket.rca_description:
+    if len(documents) < 5:
+        return {}
 
-        return {"status":"skipped"}
+    embeddings = model.encode(documents)
 
-    context = build_ticket_context(ticket)
+    kmeans = KMeans(n_clusters=min(5, len(documents)), random_state=42)
+    labels = kmeans.fit_predict(embeddings)
 
-    embedding = model.encode(context).tolist()
+    cluster_map = {}
 
-    pattern = extract_rca_pattern(ticket.rca_description)
+    for i, label in enumerate(labels):
+        cluster_map.setdefault(label, []).append(rca_list[i])
 
-    steps = extract_troubleshooting_steps(ticket.conversations)
+    cluster_cache = cluster_map
+    return cluster_map
 
-    memory_record={
+# -----------------------------
+# LLM REASONING (ADVANCED)
+# -----------------------------
+def llm_reasoning(new_ticket_text, top_matches):
 
-        "ticket_id":ticket.id,
-        "embedding":embedding,
-        "pattern":pattern,
-        "rca":ticket.rca_description,
-        "resolution":ticket.resolution_notes,
-        "steps":steps,
-        "product":ticket.product,
-        "module":ticket.module,
-        "environment":ticket.environment
+    try:
 
-    }
+        context = "\n\n".join([
+            f"""
+Ticket ID: {m['ticket_id']}
+RCA: {m['rca']}
+Similarity: {round(m['similarity'],2)}
+Details: {m['doc']}
+"""
+            for m in top_matches
+        ])
 
-    rca_memory.append(memory_record)
+        prompt = f"""
+You are an expert L3 support engineer.
 
-    save_memory()
+NEW TICKET:
+{new_ticket_text}
 
-    return {"status":"learned","memory_size":len(rca_memory)}
+SIMILAR TICKETS:
+{context}
 
-# ------------------------------------------------
-# Ticket clustering
-# ------------------------------------------------
+INSTRUCTIONS:
+- Find strongest pattern
+- Ignore weak matches
+- Combine RCA + context + conversation
+- Think step-by-step
 
-def cluster_tickets():
+RETURN STRICT JSON:
+{{
+  "predicted_rca": "...",
+  "rca_type": "...",
+  "confidence": 0-100,
+  "reasoning": "...",
+  "resolution_steps": ["step1","step2","step3"]
+}}
+"""
 
-    if len(rca_memory)<3:
-        return None
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=10
+        )
 
-    vectors=[m["embedding"] for m in rca_memory]
+        return response.json().get("response", "")
 
-    clustering = DBSCAN(eps=0.4,min_samples=2).fit(vectors)
+    except:
+        return "LLM unavailable"
 
-    return clustering.labels_
-
-# ------------------------------------------------
-# Prediction endpoint
-# ------------------------------------------------
-
+# -----------------------------
+# PREDICT
+# -----------------------------
 @app.post("/predict")
+def predict(ticket: Ticket):
 
-def predict(ticket:Ticket):
+    if len(documents) == 0:
+        return {"error": "No training data"}
 
-    context = build_ticket_context(ticket)
+    text = build_text(ticket)
 
-    query_vec = model.encode(context)
+    query_embedding = get_embedding(text)
 
-    matches=[]
+    # -----------------------------
+    # FAST SEARCH
+    # -----------------------------
+    k = min(10, len(documents))
+    D, I = index.search(np.array([query_embedding]), k=k)
 
-    for memory in rca_memory:
+    matches = []
 
-        score=cosine_similarity(query_vec,memory["embedding"])
+    for idx, dist in zip(I[0], D[0]):
+
+        similarity = 1 - dist  # faster + better
 
         matches.append({
-
-            "score":float(score),
-            "memory":memory
-
+            "ticket_id": ticket_ids[idx],
+            "rca": rca_list[idx],
+            "doc": documents[idx],
+            "similarity": similarity
         })
 
-    matches=sorted(matches,key=lambda x:x["score"],reverse=True)
+    # -----------------------------
+    # FILTER STRONG MATCHES
+    # -----------------------------
+    matches = [m for m in matches if m["similarity"] > 0.2]
 
-    best=matches[:5]
+    matches = sorted(matches, key=lambda x: x["similarity"], reverse=True)
 
-    rca_scores={}
-    recommended_steps=[]
+    top_matches = matches[:5]
 
-    for m in best:
+    # -----------------------------
+    # HYBRID SCORING
+    # -----------------------------
+    rca_scores = {}
 
-        rca=m["memory"]["rca"]
+    for m in top_matches:
 
-        rca_scores[rca]=rca_scores.get(rca,0)+m["score"]
+        rca = m["rca"]
 
-        if m["memory"]["resolution"]:
-            recommended_steps.append(m["memory"]["resolution"])
+        if rca not in rca_scores:
+            rca_scores[rca] = {"score": 0, "count": 0}
 
-        recommended_steps+=m["memory"]["steps"]
+        rca_scores[rca]["score"] += (
+            0.5 * m["similarity"] +
+            0.5 * 1
+        )
 
-    predicted_rca=None
-    confidence=0
+        rca_scores[rca]["count"] += 1
 
-    if rca_scores:
+    best_rca = None
+    max_score = 0
 
-        predicted_rca=max(rca_scores,key=rca_scores.get)
-        confidence=rca_scores[predicted_rca]
+    for rca, data in rca_scores.items():
+        if data["score"] > max_score:
+            max_score = data["score"]
+            best_rca = rca
 
-    clusters=cluster_tickets()
+    total_score = sum([v["score"] for v in rca_scores.values()])
+
+    confidence = int((max_score / total_score) * 100) if total_score else 0
+
+    # -----------------------------
+    # CLUSTERING
+    # -----------------------------
+    clusters = cluster_rca()
+
+    # -----------------------------
+    # LLM REASONING
+    # -----------------------------
+    llm_output = llm_reasoning(text, top_matches)
 
     return {
-
-        "predicted_rca":predicted_rca,
-        "confidence":round(confidence*100,2),
-
-        "recommended_steps":list(set(recommended_steps))[:5],
-
-        "similar_tickets":[
-            {
-                "ticket_id":m["memory"]["ticket_id"],
-                "similarity":round(m["score"],3)
-            }
-            for m in best
-        ],
-
-        "cluster_info": clusters.tolist() if clusters is not None else None
+        "predicted_rca": best_rca,
+        "confidence": confidence,
+        "top_matches": top_matches,
+        "clusters": clusters,
+        "llm_reasoning": llm_output
     }
