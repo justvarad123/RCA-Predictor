@@ -28,13 +28,6 @@ def get_embed_model():
         embed_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
     return embed_model
 
-def get_cross_model():
-    global cross_model
-    if cross_model is None:
-        from sentence_transformers import CrossEncoder
-        cross_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return cross_model
-
 # -----------------------------
 # GLOBAL DATA
 # -----------------------------
@@ -187,15 +180,17 @@ def hybrid_search(query):
 # -----------------------------
 # CROSS ENCODER RERANK
 # -----------------------------
+# REMOVE get_cross_model() and the CrossEncoder import entirely
+
+# REPLACE rerank() with this lightweight version:
 def rerank(query, candidates):
-    model = get_cross_model()
-
-    pairs = [(query, c["doc"]) for c in candidates]
-    scores = model.predict(pairs)
-
-    for i, s in enumerate(scores):
-        candidates[i]["rerank_score"] = float(s)
-
+    query_words = set(query.lower().split())
+    
+    for c in candidates:
+        doc_words = set(c["doc"].lower().split())
+        overlap = len(query_words & doc_words)
+        c["rerank_score"] = c["similarity"] + (0.1 * overlap)
+    
     return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
 
 # -----------------------------
