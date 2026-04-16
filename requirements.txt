@@ -2,6 +2,7 @@ fastapi
 uvicorn
 faiss-cpu
 numpy
+rank-bm25
 scikit-learn
 pydantic
 requests
