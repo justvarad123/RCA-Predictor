@@ -47,12 +47,14 @@ if os.path.exists(INDEX_FILE):
 
     documents = metadata.get("documents", [])
     rca_list = metadata.get("rca_list", [])
+    rca_type_list = metadata.get("rca_type_list", [])
     ticket_ids = metadata.get("ticket_ids", [])
 
 else:
     index = faiss.IndexFlatIP(dimension)  # 🔥 cosine similarity
     documents = []
     rca_list = []
+    rca_type_list = []
     ticket_ids = []
 
 # -----------------------------
@@ -62,12 +64,9 @@ class Ticket(BaseModel):
     ticket_id: str = ""
     subject: str = ""
     description: str = ""
-    product: str = ""
-    module: str = ""
-    environment: str = ""
     issue_type: str = ""
     rca_description: str = ""
-    resolution_notes: str = ""
+    rca_type: str = ""
     conversation: str = ""
 
 # -----------------------------
@@ -77,12 +76,9 @@ def build_text(ticket):
     return f"""
     Subject: {ticket.subject}
     Description: {ticket.description}
-    Product: {ticket.product}
-    Module: {ticket.module}
-    Environment: {ticket.environment}
     Issue Type: {ticket.issue_type}
     RCA: {ticket.rca_description}
-    Resolution: {ticket.resolution_notes}
+    RCA Type: {ticket.rca_type}
     Conversation: {ticket.conversation}
     """
 
@@ -107,6 +103,7 @@ def save_data():
         json.dump({
             "documents": documents,
             "rca_list": rca_list,
+            "rca_type_list": rca_type_list,
             "ticket_ids": ticket_ids
         }, f)
 
@@ -117,7 +114,9 @@ def save_data():
 def train_batch(tickets: list[Ticket]):
 
     global cluster_cache
-    cluster_cache = None  # invalidate cluster cache
+    cluster_cache = None
+
+    model = get_model()
 
     new_texts = []
     valid_tickets = []
@@ -148,6 +147,7 @@ def train_batch(tickets: list[Ticket]):
 
         documents.append(new_texts[i])
         rca_list.append(valid_tickets[i].rca_description)
+        rca_type_list.append(valid_tickets[i].rca_type)
         ticket_ids.append(valid_tickets[i].ticket_id)
 
     save_data()
@@ -167,7 +167,8 @@ def cluster_rca():
     if len(documents) < 5:
         return {}
 
-    embeddings = get_model().encode(documents)
+    model = get_model()
+    embeddings = model.encode(documents)
 
     kmeans = KMeans(n_clusters=min(5, len(documents)), random_state=42)
     labels = kmeans.fit_predict(embeddings)
@@ -195,6 +196,7 @@ def llm_reasoning(new_ticket_text, top_matches):
             f"""
 Ticket ID: {m['ticket_id']}
 RCA: {m['rca']}
+Type: {m['rca_type']}
 Similarity: {round(m['similarity'],2)}
 """
             for m in top_matches
@@ -265,80 +267,60 @@ def predict(ticket: Ticket):
         return {"error": "No training data"}
 
     text = build_text(ticket)
-
     query_embedding = get_embedding(text)
 
-    # -----------------------------
-    # FAST SEARCH
-    # -----------------------------
     k = min(10, len(documents))
     D, I = index.search(np.array([query_embedding]), k=k)
 
     matches = []
 
-    for idx, dist in zip(I[0], D[0]):
-
-        similarity = 1 - dist  # faster + better
+    for idx, score in zip(I[0], D[0]):
+        similarity = float(score)  # ✅ FIXED
 
         matches.append({
             "ticket_id": ticket_ids[idx],
             "rca": rca_list[idx],
+            "rca_type": rca_type_list[idx],
             "doc": documents[idx],
             "similarity": similarity
         })
 
-    # -----------------------------
-    # FILTER STRONG MATCHES
-    # -----------------------------
-    matches = [m for m in matches if m["similarity"] > 0.2]
-
+    # ✅ SORT DIRECTLY (no 1 - dist)
     matches = sorted(matches, key=lambda x: x["similarity"], reverse=True)
 
     top_matches = matches[:5]
 
+    if not top_matches:
+        return {"error": "No matches found"}
+
     # -----------------------------
-    # HYBRID SCORING
+    # HYBRID SCORING (RCA + TYPE)
     # -----------------------------
     rca_scores = {}
 
     for m in top_matches:
+        key = (m["rca"], m["rca_type"])
 
-        rca = m["rca"]
+        if key not in rca_scores:
+            rca_scores[key] = 0
 
-        if rca not in rca_scores:
-            rca_scores[rca] = {"score": 0, "count": 0}
+        rca_scores[key] += m["similarity"]
 
-        rca_scores[rca]["score"] += (
-            0.5 * m["similarity"] +
-            0.5 * 1
-        )
+    # ✅ pick best RCA + TYPE together
+    best_pair = max(rca_scores, key=rca_scores.get)
 
-        rca_scores[rca]["count"] += 1
+    best_rca, best_rca_type = best_pair
+    best_score = rca_scores[best_pair]
 
-    best_rca = None
-    max_score = 0
+    total_score = sum(rca_scores.values())
+    confidence = int((best_score / total_score) * 100) if total_score else 0
 
-    for rca, data in rca_scores.items():
-        if data["score"] > max_score:
-            max_score = data["score"]
-            best_rca = rca
-
-    total_score = sum([v["score"] for v in rca_scores.values()])
-
-    confidence = int((max_score / total_score) * 100) if total_score else 0
-
-    # -----------------------------
-    # CLUSTERING
-    # -----------------------------
     clusters = cluster_rca()
-
-    # -----------------------------
-    # LLM REASONING
-    # -----------------------------
     llm_output = llm_reasoning(text, top_matches)
 
     return {
         "predicted_rca": best_rca,
+        "rca_type": best_rca_type,  # ✅ FIXED
         "confidence": confidence,
         "top_matches": top_matches,
         "clusters": clusters,
