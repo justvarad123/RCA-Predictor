@@ -1,11 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import json
 import os
-from sklearn.cluster import KMeans
+from rank_bm25 import BM25Okapi
 import requests
 
 app = FastAPI()
@@ -17,45 +16,55 @@ INDEX_FILE = "faiss_index.bin"
 META_FILE = "metadata.json"
 
 # -----------------------------
-# LOAD MODEL
+# MODELS (LAZY LOAD)
 # -----------------------------
-model = None
+embed_model = None
+cross_model = None
 
-def get_model():
-    global model
-    if model is None:
+def get_embed_model():
+    global embed_model
+    if embed_model is None:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
-    return model
+        embed_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
+    return embed_model
+
+def get_cross_model():
+    global cross_model
+    if cross_model is None:
+        from sentence_transformers import CrossEncoder
+        cross_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return cross_model
 
 # -----------------------------
-# GLOBAL CACHE
-# -----------------------------
-embedding_cache = {}
-cluster_cache = None
-
-# -----------------------------
-# LOAD / INIT STORAGE
+# GLOBAL DATA
 # -----------------------------
 dimension = 384
+documents = []
+rca_list = []
+rca_type_list = []
+ticket_ids = []
+tokenized_docs = []
+bm25 = None
 
+# -----------------------------
+# LOAD DATA
+# -----------------------------
 if os.path.exists(INDEX_FILE):
     index = faiss.read_index(INDEX_FILE)
 
     with open(META_FILE, "r") as f:
-        metadata = json.load(f)
+        meta = json.load(f)
 
-    documents = metadata.get("documents", [])
-    rca_list = metadata.get("rca_list", [])
-    rca_type_list = metadata.get("rca_type_list", [])
-    ticket_ids = metadata.get("ticket_ids", [])
+    documents = meta["documents"]
+    rca_list = meta["rca_list"]
+    rca_type_list = meta["rca_type_list"]
+    ticket_ids = meta["ticket_ids"]
+
+    tokenized_docs = [doc.split() for doc in documents]
+    bm25 = BM25Okapi(tokenized_docs)
 
 else:
-    index = faiss.IndexFlatIP(dimension)  # 🔥 cosine similarity
-    documents = []
-    rca_list = []
-    rca_type_list = []
-    ticket_ids = []
+    index = faiss.IndexFlatIP(dimension)
 
 # -----------------------------
 # REQUEST MODEL
@@ -72,33 +81,19 @@ class Ticket(BaseModel):
 # -----------------------------
 # HELPERS
 # -----------------------------
-def build_text(ticket):
-    return f"""
-    Subject: {ticket.subject}
-    Description: {ticket.description}
-    Issue Type: {ticket.issue_type}
-    RCA: {ticket.rca_description}
-    RCA Type: {ticket.rca_type}
-    Conversation: {ticket.conversation}
-    """
+def build_text(t):
+    return f"{t.subject} {t.description} {t.issue_type} {t.conversation}"
 
-def normalize(vec):
-    return vec / np.linalg.norm(vec)
+def normalize(v):
+    return v / np.linalg.norm(v)
 
-def get_embedding(text):
-    if text in embedding_cache:
-        return embedding_cache[text]
-
-    model = get_model()
+def embed(text):
+    model = get_embed_model()
     emb = model.encode(text)
-    emb = normalize(emb)
+    return normalize(emb)
 
-    embedding_cache[text] = emb
-    return emb
-
-def save_data():
+def save():
     faiss.write_index(index, INDEX_FILE)
-
     with open(META_FILE, "w") as f:
         json.dump({
             "documents": documents,
@@ -108,81 +103,103 @@ def save_data():
         }, f)
 
 # -----------------------------
-# TRAIN (BATCH)
+# TRAIN
 # -----------------------------
 @app.post("/train_batch")
 def train_batch(tickets: list[Ticket]):
+    global bm25, tokenized_docs
 
-    global cluster_cache
-    cluster_cache = None
+    texts = []
+    valid = []
 
-    model = get_model()
-
-    new_texts = []
-    valid_tickets = []
-
-    for ticket in tickets:
-
-        if not ticket.rca_description or not ticket.issue_type:
+    for t in tickets:
+        if not t.rca_description or not t.issue_type:
+            continue
+        if t.ticket_id in ticket_ids:
             continue
 
-        if ticket.ticket_id in ticket_ids:
-            continue
+        txt = build_text(t)
+        texts.append(txt)
+        valid.append(t)
 
-        text = build_text(ticket)
-
-        new_texts.append(text)
-        valid_tickets.append(ticket)
-
-    if not new_texts:
+    if not texts:
         return {"message": "No valid tickets"}
 
-    # 🚀 BATCH EMBEDDING
-    embeddings = model.encode(new_texts)
+    model = get_embed_model()
+    embeddings = model.encode(texts)
 
     for i, emb in enumerate(embeddings):
         emb = normalize(emb)
 
         index.add(np.array([emb]))
 
-        documents.append(new_texts[i])
-        rca_list.append(valid_tickets[i].rca_description)
-        rca_type_list.append(valid_tickets[i].rca_type)
-        ticket_ids.append(valid_tickets[i].ticket_id)
+        documents.append(texts[i])
+        rca_list.append(valid[i].rca_description)
+        rca_type_list.append(valid[i].rca_type)
+        ticket_ids.append(valid[i].ticket_id)
 
-    save_data()
+    tokenized_docs = [doc.split() for doc in documents]
+    bm25 = BM25Okapi(tokenized_docs)
 
-    return {"stored": len(valid_tickets), "total": len(documents)}
+    save()
 
-# -----------------------------
-# CLUSTERING (CACHED)
-# -----------------------------
-# def cluster_rca():
-
-    global cluster_cache
-
-    if cluster_cache:
-        return cluster_cache
-
-    if len(documents) < 5:
-        return {}
-
-    model = get_model()
-    embeddings = model.encode(documents)
-
-    kmeans = KMeans(n_clusters=min(5, len(documents)), random_state=42)
-    labels = kmeans.fit_predict(embeddings)
-
-    cluster_map = {}
-
-    for i, label in enumerate(labels):
-        cluster_map.setdefault(int(label), []).append(rca_list[i])
-
-    cluster_cache = cluster_map
-    return cluster_map
+    return {"stored": len(valid), "total": len(documents)}
 
 # -----------------------------
-# LLM REASONING (ADVANCED)
+# HYBRID SEARCH
+# -----------------------------
+def hybrid_search(query):
+
+    query_emb = embed(query)
+
+    # FAISS
+    k = min(20, len(documents))
+    D, I = index.search(np.array([query_emb]), k)
+
+    vector_scores = {idx: float(score) for idx, score in zip(I[0], D[0])}
+
+    # BM25
+    tokenized_query = query.split()
+    bm25_scores = bm25.get_scores(tokenized_query)
+
+    # COMBINE
+    combined = {}
+    for i in range(len(documents)):
+        combined[i] = (
+            0.6 * vector_scores.get(i, 0) +
+            0.4 * bm25_scores[i]
+        )
+
+    ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+
+    results = []
+    for idx, score in ranked[:20]:
+        results.append({
+            "ticket_id": ticket_ids[idx],
+            "rca": rca_list[idx],
+            "rca_type": rca_type_list[idx],
+            "doc": documents[idx],
+            "similarity": score
+        })
+
+    return results
+
+# -----------------------------
+# CROSS ENCODER RERANK
+# -----------------------------
+def rerank(query, candidates):
+    model = get_cross_model()
+
+    pairs = [(query, c["doc"]) for c in candidates]
+    scores = model.predict(pairs)
+
+    for i, s in enumerate(scores):
+        candidates[i]["rerank_score"] = float(s)
+
+    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+
+# -----------------------------
+# LLM
 # -----------------------------
 def llm_reasoning(new_ticket_text, top_matches):
 
@@ -263,70 +280,39 @@ RETURN JSON:
 @app.post("/predict")
 def predict(ticket: Ticket):
 
-    if len(documents) == 0:
+    if not documents:
         return {"error": "No training data"}
 
     text = build_text(ticket)
-    query_embedding = get_embedding(text)
 
-    k = min(10, len(documents))
-    D, I = index.search(np.array([query_embedding]), k=k)
+    results = hybrid_search(text)
 
-    matches = []
+    # 🔥 CROSS ENCODER
+    reranked = rerank(text, results)
 
-    for idx, score in zip(I[0], D[0]):
-        similarity = float(score)  # ✅ FIXED
+    top_matches = reranked[:5]
 
-        matches.append({
-            "ticket_id": ticket_ids[idx],
-            "rca": rca_list[idx],
-            "rca_type": rca_type_list[idx],
-            "doc": documents[idx],
-            "similarity": similarity
-        })
-
-    # ✅ SORT DIRECTLY (no 1 - dist)
-    matches = sorted(matches, key=lambda x: x["similarity"], reverse=True)
-
-    top_matches = matches[:5]
-
-    if not top_matches:
-        return {"error": "No matches found"}
-
-    # -----------------------------
-    # HYBRID SCORING (RCA + TYPE)
-    # -----------------------------
-    rca_scores = {}
-
+    # RCA voting
+    scores = {}
     for m in top_matches:
         key = (m["rca"], m["rca_type"])
+        scores[key] = scores.get(key, 0) + m["rerank_score"]
 
-        if key not in rca_scores:
-            rca_scores[key] = 0
+    best = max(scores, key=scores.get)
 
-        rca_scores[key] += m["similarity"]
+    total = sum(scores.values())
+    confidence = int((scores[best] / total) * 100) if total else 0
 
-    # ✅ pick best RCA + TYPE together
-    best_pair = max(rca_scores, key=rca_scores.get)
-
-    best_rca, best_rca_type = best_pair
-    best_score = rca_scores[best_pair]
-
-    total_score = sum(rca_scores.values())
-    confidence = int((best_score / total_score) * 100) if total_score else 0
-
-    # clusters = cluster_rca()
-    llm_output = llm_reasoning(text, top_matches)
+    llm = llm_reasoning(text, top_matches)
 
     return {
-        "predicted_rca": best_rca,
-        "rca_type": best_rca_type,  # ✅ FIXED
+        "predicted_rca": best[0],
+        "rca_type": best[1],
         "confidence": confidence,
         "top_matches": top_matches,
-        # "clusters": clusters,
-        "llm_reasoning": llm_output
+        "llm_reasoning": llm
     }
 
 @app.get("/")
 def health():
-    return {"status": "running"}
+    return {"status": "hybrid + rerank running"}
