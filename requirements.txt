@@ -1,8 +1,10 @@
 fastapi
 uvicorn
-sentence-transformers
 faiss-cpu
 numpy
 scikit-learn
 pydantic
 requests
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers
