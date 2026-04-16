@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import faiss
-import numpy as np
-import json
-import os
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct
+from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
+import uuid
+import os
 import requests
 
 app = FastAPI()
@@ -12,52 +13,33 @@ app = FastAPI()
 # -----------------------------
 # CONFIG
 # -----------------------------
-INDEX_FILE = "faiss_index.bin"
-META_FILE = "metadata.json"
+QDRANT_URL = os.environ.get("QDRANT_URL")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+COLLECTION = "tickets"
+
+client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY
+)
 
 # -----------------------------
-# MODELS (LAZY LOAD)
+# MODEL
 # -----------------------------
-embed_model = None
-cross_model = None
-
-def get_embed_model():
-    global embed_model
-    if embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        embed_model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
-    return embed_model
+model = SentenceTransformer("paraphrase-MiniLM-L3-v2")
 
 # -----------------------------
-# GLOBAL DATA
+# INIT COLLECTION
 # -----------------------------
-dimension = 384
-documents = []
-rca_list = []
-rca_type_list = []
-ticket_ids = []
-tokenized_docs = []
-bm25 = None
+def init_collection():
+    collections = [c.name for c in client.get_collections().collections]
 
-# -----------------------------
-# LOAD DATA
-# -----------------------------
-if os.path.exists(INDEX_FILE):
-    index = faiss.read_index(INDEX_FILE)
+    if COLLECTION not in collections:
+        client.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
 
-    with open(META_FILE, "r") as f:
-        meta = json.load(f)
-
-    documents = meta["documents"]
-    rca_list = meta["rca_list"]
-    rca_type_list = meta["rca_type_list"]
-    ticket_ids = meta["ticket_ids"]
-
-    tokenized_docs = [doc.split() for doc in documents]
-    bm25 = BM25Okapi(tokenized_docs)
-
-else:
-    index = faiss.IndexFlatIP(dimension)
+init_collection()
 
 # -----------------------------
 # REQUEST MODEL
@@ -77,121 +59,76 @@ class Ticket(BaseModel):
 def build_text(t):
     return f"{t.subject} {t.description} {t.issue_type} {t.conversation}"
 
-def normalize(v):
-    return v / np.linalg.norm(v)
-
 def embed(text):
-    model = get_embed_model()
-    emb = model.encode(text)
-    return normalize(emb)
-
-def save():
-    faiss.write_index(index, INDEX_FILE)
-    with open(META_FILE, "w") as f:
-        json.dump({
-            "documents": documents,
-            "rca_list": rca_list,
-            "rca_type_list": rca_type_list,
-            "ticket_ids": ticket_ids
-        }, f)
+    return model.encode(text).tolist()
 
 # -----------------------------
-# TRAIN
+# TRAIN → STORE IN QDRANT
 # -----------------------------
 @app.post("/train_batch")
 def train_batch(tickets: list[Ticket]):
-    global bm25, tokenized_docs
 
-    texts = []
-    valid = []
+    points = []
 
     for t in tickets:
-        if not t.rca_description or not t.issue_type:
-            continue
-        if t.ticket_id in ticket_ids:
+        if not t.rca_description:
             continue
 
-        txt = build_text(t)
-        texts.append(txt)
-        valid.append(t)
+        vector = embed(build_text(t))
 
-    if not texts:
-        return {"message": "No valid tickets"}
-
-    model = get_embed_model()
-    embeddings = model.encode(texts)
-
-    for i, emb in enumerate(embeddings):
-        emb = normalize(emb)
-
-        index.add(np.array([emb]))
-
-        documents.append(texts[i])
-        rca_list.append(valid[i].rca_description)
-        rca_type_list.append(valid[i].rca_type)
-        ticket_ids.append(valid[i].ticket_id)
-
-    tokenized_docs = [doc.split() for doc in documents]
-    bm25 = BM25Okapi(tokenized_docs)
-
-    save()
-
-    return {"stored": len(valid), "total": len(documents)}
-
-# -----------------------------
-# HYBRID SEARCH
-# -----------------------------
-def hybrid_search(query):
-
-    query_emb = embed(query)
-
-    # FAISS
-    k = min(20, len(documents))
-    D, I = index.search(np.array([query_emb]), k)
-
-    vector_scores = {idx: float(score) for idx, score in zip(I[0], D[0])}
-
-    # BM25
-    tokenized_query = query.split()
-    bm25_scores = bm25.get_scores(tokenized_query)
-
-    # COMBINE
-    combined = {}
-    for i in range(len(documents)):
-        combined[i] = (
-            0.6 * vector_scores.get(i, 0) +
-            0.4 * bm25_scores[i]
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector,
+                payload={
+                    "ticket_id": t.ticket_id,
+                    "rca": t.rca_description,
+                    "rca_type": t.rca_type,
+                    "text": build_text(t)
+                }
+            )
         )
 
-    ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    if points:
+        client.upsert(collection_name=COLLECTION, points=points)
 
-    results = []
-    for idx, score in ranked[:20]:
-        results.append({
-            "ticket_id": ticket_ids[idx],
-            "rca": rca_list[idx],
-            "rca_type": rca_type_list[idx],
-            "doc": documents[idx],
-            "similarity": score
-        })
-
-    return results
+    return {"stored": len(points)}
 
 # -----------------------------
-# CROSS ENCODER RERANK
+# SEARCH
 # -----------------------------
-# REMOVE get_cross_model() and the CrossEncoder import entirely
+def search(query):
+    vector = embed(query)
 
-# REPLACE rerank() with this lightweight version:
-def rerank(query, candidates):
-    query_words = set(query.lower().split())
-    
-    for c in candidates:
-        doc_words = set(c["doc"].lower().split())
-        overlap = len(query_words & doc_words)
-        c["rerank_score"] = c["similarity"] + (0.1 * overlap)
-    
-    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=vector,
+        limit=20
+    )
+
+    return [
+        {
+            "ticket_id": r.payload["ticket_id"],
+            "rca": r.payload["rca"],
+            "rca_type": r.payload["rca_type"],
+            "doc": r.payload["text"],
+            "score": r.score
+        }
+        for r in results
+    ]
+
+# -----------------------------
+# SIMPLE RERANK
+# -----------------------------
+def rerank(query, results):
+    q_words = set(query.lower().split())
+
+    for r in results:
+        d_words = set(r["doc"].lower().split())
+        overlap = len(q_words & d_words)
+        r["rerank"] = r["score"] + (0.1 * overlap)
+
+    return sorted(results, key=lambda x: x["rerank"], reverse=True)
 
 # -----------------------------
 # LLM
@@ -275,39 +212,36 @@ RETURN JSON:
 @app.post("/predict")
 def predict(ticket: Ticket):
 
-    if not documents:
-        return {"error": "No training data"}
+    query = build_text(ticket)
 
-    text = build_text(ticket)
+    results = search(query)
 
-    results = hybrid_search(text)
+    if not results:
+        return {"error": "No data in vector DB"}
 
-    # 🔥 CROSS ENCODER
-    reranked = rerank(text, results)
+    reranked = rerank(query, results)
+    top = reranked[:5]
 
-    top_matches = reranked[:5]
-
-    # RCA voting
     scores = {}
-    for m in top_matches:
-        key = (m["rca"], m["rca_type"])
-        scores[key] = scores.get(key, 0) + m["rerank_score"]
+    for r in top:
+        key = (r["rca"], r["rca_type"])
+        scores[key] = scores.get(key, 0) + r["rerank"]
 
     best = max(scores, key=scores.get)
 
     total = sum(scores.values())
-    confidence = int((scores[best] / total) * 100) if total else 0
+    confidence = int((scores[best] / total) * 100)
 
-    llm = llm_reasoning(text, top_matches)
+    llm = llm_reasoning(query, top)
 
     return {
         "predicted_rca": best[0],
         "rca_type": best[1],
         "confidence": confidence,
-        "top_matches": top_matches,
+        "top_matches": top,
         "llm_reasoning": llm
     }
 
 @app.get("/")
 def health():
-    return {"status": "hybrid + rerank running"}
+    return {"status": "Qdrant running 🚀"}
