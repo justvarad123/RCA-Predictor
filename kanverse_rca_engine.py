@@ -157,7 +157,7 @@ def train_batch(tickets: list[Ticket]):
 # -----------------------------
 # CLUSTERING (CACHED)
 # -----------------------------
-def cluster_rca():
+# def cluster_rca():
 
     global cluster_cache
 
@@ -315,7 +315,7 @@ def predict(ticket: Ticket):
     total_score = sum(rca_scores.values())
     confidence = int((best_score / total_score) * 100) if total_score else 0
 
-    clusters = cluster_rca()
+    # clusters = cluster_rca()
     llm_output = llm_reasoning(text, top_matches)
 
     return {
@@ -323,7 +323,7 @@ def predict(ticket: Ticket):
         "rca_type": best_rca_type,  # ✅ FIXED
         "confidence": confidence,
         "top_matches": top_matches,
-        "clusters": clusters,
+        # "clusters": clusters,
         "llm_reasoning": llm_output
     }
 
