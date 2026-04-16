@@ -6,5 +6,7 @@ rank-bm25
 scikit-learn
 pydantic
 requests
+qdrant-client
+sentence-transformers
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
